@@ -15,6 +15,7 @@
 """PyTorch ViT model."""
 
 import collections.abc
+import os
 import math
 from typing import Callable, Optional, Union
 
@@ -218,6 +219,81 @@ class ViTSelfAttention(nn.Module):
         self.key = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
         self.value = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
 
+    def bipartite_soft_matching(self, k: torch.Tensor, r: int):
+        """
+        Input is k from attention, size [batch, tokens, channels].
+        """
+
+        # k: [batch_size, num_patches + 1, embed_dim]
+        # 对 k 特征维作归一化处理，使其只表示方向而不表示长度，利于相似性计算
+        k = k / k.norm(dim=-1, keepdim=True)
+        # a: [batch_size, num_patches / 2 + 1, embed_dim]
+        # b: [batch_size, num_patches / 2, embed_dim]
+        a, b = k[..., ::2, :], k[..., 1::2, :]
+        # 避免 r 超过当前层可以合并的最大 token 数
+        r = min(r, b.shape[-2])
+
+        # dot product to get similarity scores
+        # scores: [batch_size, num_patches / 2 + 1, num_patches / 2]
+        scores = a @ b.transpose(-1, -2)
+        # don't merge cls token（以下注释仅假设省略 cls，实际存在）
+        # scores[batch_size, num_patches / 2, num_patches / 2]
+        scores[..., 0, :] = -math.inf
+        
+        # node_max: [batch_size, num_patches / 2]，元素值为当前行的最大值
+        # node_idx: [batch_size, num_patches / 2]，元素值为当前行最大值的索引
+        node_max, node_idx = scores.max(dim=-1)
+        # edge_idx: [batch_size, num_patches / 2, 1]
+        # argsort 先记录按照当前行号记录当前行索引，后根据降序排列调整分量顺序，分量值替换为之前记录的行索引
+        # 通过 [..., None] 将其变为三维张量，方便后续广播操作
+        edge_idx = node_max.argsort(dim=-1, descending=True)[..., None]
+        
+        unm_idx = edge_idx[..., r:, :]  # Unmerged Tokens
+        # src_idx: [batch_size, r, 1]
+        src_idx = edge_idx[..., :r, :]  # Merged Tokens
+        # src_idx 满足除 dim 维，其余维长度与 node_idx 相同，dim维作为取值的索引
+        # gather() 从 node_idx 中取出 src_idx 对应的索引值，得到 src_idx 的实际索引
+        # dist_idx: [batch_size, r, 1]
+        dst_idx = node_idx[..., None].gather(dim=-2, index=src_idx)
+        
+        # 由于倒数第二维记录的就是排序前的行数，根据该值进行sort可以恢复为原来的相对位置
+        unm_idx = unm_idx.sort(dim=-2)[0]  # Sort cls token back to idx 0
+        
+        # 上面内容仅用于计算索引，下面定义 merge 函数用于实际的合并操作
+        # 通过闭包操作，使得 merge 函数可以访问 unm_idx, src_idx, dst_idx
+        def merge(x: torch.Tensor, s_in: torch.Tensor = None):
+            """
+            input x is of shape [batch, tokens, channels].
+            input s_in is of shape [batch, tokens]. 
+            """
+            src_x, dst_x = x[..., ::2, :], x[..., 1::2, :]
+            n, t1, c = src_x.shape
+            
+            # unm 表示仅取出 src 中无需合并的部分
+            # unm: [batch_size, num_patches / 2 + 1 - r, embed_dim]
+            unm_x = src_x.gather(dim=-2, index=unm_idx.expand(n, t1 - r, c))
+            
+            # src 表示取出 src 中需要合并的部分
+            # src: [batch_size, r, embed_dim]
+            src_x = src_x.gather(dim=-2, index=src_idx.expand(n, r, c))
+            
+            # 从 dst 中根据 dst_index 在 dim 维度上索引与 src 进行每个元素相加操作
+            # dst: [batch_size, r, embed_dim]
+            dst_x = dst_x.scatter_add(dim=-2, index=dst_idx.expand(n, r, c), src=src_x)
+            
+            
+            # 按照 unm, dst 的顺序进行拼接（无需保留原输入 token 顺序）
+            if s_in is None:
+                return torch.cat([unm_x, dst_x], dim=-2), s_in
+            
+            src_s, dst_s = s_in[..., ::2], s_in[..., 1::2]
+            unm_s = src_s.gather(dim=-1, index=unm_idx.squeeze(-1))
+            src_s = src_s.gather(dim=-1, index=src_idx.squeeze(-1))
+            dst_s = dst_s.scatter_add(dim=-1, index=dst_idx.squeeze(-1), src=src_s)
+            
+            return torch.cat([unm_x, dst_x], dim=-2), torch.cat([unm_s, dst_s], dim=-1)
+        return merge
+
     def forward(
         self,
         hidden_states,
@@ -227,7 +303,9 @@ class ViTSelfAttention(nn.Module):
         batch_size, seq_length, _ = hidden_states.shape
         key_layer = (
             self.key(hidden_states)
+            # (batch_size, num_patches + 1, num_attention_heads, attention_head_size)
             .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
+            # (batch_size, num_attention_heads, num_patches + 1, attention_head_size)
             .transpose(1, 2)
         )
         value_layer = (
@@ -251,6 +329,9 @@ class ViTSelfAttention(nn.Module):
             else:
                 attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
+        # default attention_interface is eager_attention_forward
+        # context_layer = QK/ sqrt(d_k) * V, shape is (batch_size, num_patches + 1, num_attention_heads, attention_head_size)
+        # attention_probs = softmax(QK), shape is (batch_size, num_attention_heads, num_patches + 1, num_patches + 1)
         context_layer, attention_probs = attention_interface(
             self,
             query_layer,
@@ -262,10 +343,17 @@ class ViTSelfAttention(nn.Module):
             dropout=0.0 if not self.training else self.dropout_prob,
         )
 
+        # new_context_layer_shape is (batch_size, num_patches + 1，all_head_size)
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
         context_layer = context_layer.reshape(new_context_layer_shape)
 
         outputs = (context_layer, attention_probs) if output_attentions else (context_layer,)
+
+        # Token Merging
+        self.merge_fn: Callable = None
+        if os.environ.get("TOME_R") not in ("0", None, ""):
+            self.merge_fn = self.bipartite_soft_matching(key_layer.mean(dim=1), 
+                                                         int(os.environ.get("TOME_R")))
 
         return outputs
 
@@ -324,6 +412,12 @@ class ViTAttention(nn.Module):
         attention_output = self.output(self_outputs[0], hidden_states)
 
         outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
+
+        # Token Merging
+        self.merge_fn: Callable = None
+        if os.environ.get("TOME_R") not in ("0", None, ""):
+            self.merge_fn = self.attention.merge_fn
+
         return outputs
 
 
@@ -387,6 +481,10 @@ class ViTLayer(GradientCheckpointingLayer):
 
         # first residual connection
         hidden_states = attention_output + hidden_states
+        
+        # Token Merging
+        if os.environ.get("TOME_R") not in ("0", None, ""):
+            hidden_states = self.attention.merge_fn(hidden_states)[0]
 
         # in ViT, layernorm is also applied after self-attention
         layer_output = self.layernorm_after(hidden_states)
