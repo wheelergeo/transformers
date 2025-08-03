@@ -27,9 +27,12 @@
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Union
 
+
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
@@ -393,19 +396,27 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
         window_index: list = []
         cu_window_seqlens: list = [0]
         window_index_id = 0
+        # vit_merger_window_size = 112 / 2 / 14 = 4
         vit_merger_window_size = self.window_size // self.spatial_merge_size // self.patch_size
 
         for grid_t, grid_h, grid_w in grid_thw:
+            # llm_grid_h = 36 / 2 = 18
             llm_grid_h, llm_grid_w = (
                 grid_h // self.spatial_merge_size,
                 grid_w // self.spatial_merge_size,
             )
+            # index = (1, 18, 18)
             index = torch.arange(grid_t * llm_grid_h * llm_grid_w).reshape(grid_t, llm_grid_h, llm_grid_w)
+            # 将 llm_grid_h 补齐到 vit_merger_window_size 整数倍
             pad_h = vit_merger_window_size - llm_grid_h % vit_merger_window_size
             pad_w = vit_merger_window_size - llm_grid_w % vit_merger_window_size
+            # num_windows_h = (18 + 2) / 4 = 5
             num_windows_h = (llm_grid_h + pad_h) // vit_merger_window_size
             num_windows_w = (llm_grid_w + pad_w) // vit_merger_window_size
+            # 在 index 的最后一个维度填充 pad_w 个 -100，在倒数第二个维度填充 pad_h 个 -100
+            # index_padded = (1, 20, 20)
             index_padded = F.pad(index, (0, pad_w, 0, pad_h), "constant", -100)
+            # index_padded = (1, 5, 4, 5, 4)
             index_padded = index_padded.reshape(
                 grid_t,
                 num_windows_h,
@@ -413,19 +424,27 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
                 num_windows_w,
                 vit_merger_window_size,
             )
+            # index_padded = (1, 5, 5, 4, 4) -> (1, 25, 4, 4)
             index_padded = index_padded.permute(0, 1, 3, 2, 4).reshape(
                 grid_t,
                 num_windows_h * num_windows_w,
                 vit_merger_window_size,
                 vit_merger_window_size,
             )
+            # 计算 index_padded 中每个 windows 的有效长度，reshape 则保留一个维度 (25)
             seqlens = (index_padded != -100).sum([2, 3]).reshape(-1)
+            # index_padded = (400)
             index_padded = index_padded.reshape(-1)
+            # 保留窗口内有效索引 index_new = (400 - padding_size) = (324)
             index_new = index_padded[index_padded != -100]
+            # window_index_id 为图片(视频)偏移，将所有图片(视频)有效索引放到同一个列表中
             window_index.append(index_new + window_index_id)
+            # seqlens.cumsum(0) * self.spatial_merge_unit 则计算每个 token 实际包含有效 patch 数
+            # cu_seqlens_tmp 表示跨图片(视频)累计长度，元素差值即为对应图片得有效 patch 数，因此首先要 + cu_window_seqlens[-1]
             cu_seqlens_tmp = seqlens.cumsum(0) * self.spatial_merge_unit + cu_window_seqlens[-1]
             cu_window_seqlens.extend(cu_seqlens_tmp.tolist())
             window_index_id += (grid_t * llm_grid_h * llm_grid_w).item()
+        # window_index = (324 * len(grid_thw))
         window_index = torch.cat(window_index, dim=0)
 
         return window_index, cu_window_seqlens
@@ -441,26 +460,42 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
         Returns:
             `torch.Tensor`: hidden_states.
         """
+        # hidden_states = (1296, 1280)
         hidden_states = self.patch_embed(hidden_states)
+        # rotary_pos_emb = (1296, 40) 仅在 attention 过程拼接到 hidden_states，最终输出不包含该特征
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        # window_index 为每个窗口内需要关注的 index，并且每个窗口的 index 连续存放，方便后续以窗口为单位操作
         window_index, cu_window_seqlens = self.get_window_index(grid_thw)
+        # cu_window_seqlens 为每个窗口结束时有效 patch 累积和，元素间差值即为对应窗口的有效 patch 数，长度为 窗口数+1
         cu_window_seqlens = torch.tensor(
             cu_window_seqlens,
             device=hidden_states.device,
             dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
         )
+        # unique_consecutive 去除张量中连续重复的元素
         cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
 
         seq_len, _ = hidden_states.size()
+        # hidden_states = (324, 4, 1280)
         hidden_states = hidden_states.reshape(seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
+        # 这里并不是保留 window select patch，而是调整原 hidden_states 的patch顺序，将同一个窗口处理的 patch 连续存放
         hidden_states = hidden_states[window_index, :, :]
+        # hidden_states = (1296, 1280)
         hidden_states = hidden_states.reshape(seq_len, -1)
+
+        # 按照窗口索引的顺序调整位置编码
+        # rotary_pos_emb = (324, 4, 40)
         rotary_pos_emb = rotary_pos_emb.reshape(seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
         rotary_pos_emb = rotary_pos_emb[window_index, :, :]
+        # rotary_pos_emb = (1296, 40)
         rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        # position_embeddings = (1296, 80)
         position_embeddings = (emb.cos(), emb.sin())
 
+        # repeat_interleave 表示对 grid_thw[:, 1] * grid_thw[:, 2] 对应 grid_thw[:, 0] 进行重复
+        # grid_thw[:, 1] * grid_thw[:, 2] = (1), grid_thw[:, 0] = (1)
+        # repeat_interleave = (1)
         cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
             dim=0,
             # Select dtype based on the following factors:
@@ -469,14 +504,18 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
             # See https://github.com/huggingface/transformers/pull/34852 for more information
             dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
         )
+        # cu_seqlens = (2)
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
         for layer_num, blk in enumerate(self.blocks):
+            # 对于不使用窗口注意力的层，关注窗口全部区域
             if layer_num in self.fullatt_block_indexes:
                 cu_seqlens_now = cu_seqlens
             else:
                 cu_seqlens_now = cu_window_seqlens
 
+            # blk 内部使用窗口注意力，cu_seqlens相当于是掩码作为注意力需要关注的地方
+            # 位置编码仅供注意力使用，最后不作为 token 特征
             hidden_states = blk(
                 hidden_states,
                 cu_seqlens=cu_seqlens_now,
@@ -484,7 +523,10 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
                 **kwargs,
             )
 
+        # 对 token 进一步合并，并经过一个 MLP 层映射到 out_hidden_size 维度对齐 text embedding
+        # hiddent_states = (1296, 1280) -> (1296/4, 4*1280) -> (324, 3584)
         hidden_states = self.merger(hidden_states)
+        # 根据窗口机制选取的索引，恢复 patch 的原始顺序，保证输出与输入一致。
         reverse_indices = torch.argsort(window_index)
         hidden_states = hidden_states[reverse_indices, :]
 
@@ -1185,9 +1227,13 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                 The temporal, height and width of feature shape of each image in LLM.
         """
         pixel_values = pixel_values.type(self.visual.dtype)
+        # image_embeds = (324, 3584)
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        # split_sizes = 1×36×36 / (2×2) = 324
         split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
+        # [(324, 3584), (324, 3584), ...]
         image_embeds = torch.split(image_embeds, split_sizes)
+
         return image_embeds
 
     def get_placeholder_mask(
@@ -1230,6 +1276,93 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
 
         return special_image_mask, special_video_mask
 
+    # divprune
+    def pairwise_cosine_similarity(self, matrix):
+        # matrix.shape (num_patches, feature_dim)
+        # 对 matrix 作归一化处理
+        norm_matrix = matrix / matrix.norm(dim=1, keepdim=True)
+        cosine_similarity = torch.mm(norm_matrix, norm_matrix.t())
+
+        # cosine_similarity.shape (num_patches, num_patches)，每个分量表示 token[i] 和 token[j] 的余弦相似度
+        return cosine_similarity
+
+    # divprune
+    def divprune(self, visual_feature_vectors, image_feature_length, cosine_matrix=None, threshold_ratio=0.1):
+        """
+        Diversity Pruning Implementation.
+
+        Args:
+            visual_feature_vectors (torch.Tensor): The visual feature vectors to be pruned.
+            image_feature_length (int): The length of the image feature vectors.
+            cosine_matrix (torch.Tensor, optional): Precomputed cosine similarity matrix. If None, it will be computed.
+            threshold_ratio (float): The ratio of features to keep based on diversity pruning.
+        """
+        # 确保保留的 patches 是整数，round 函数四舍五入
+        threshold_terms = int(round(threshold_ratio*image_feature_length))
+        if cosine_matrix is None:
+            # 越接近 0 越相似
+            cosine_matrix = 1.0 - (self.pairwise_cosine_similarity(visual_feature_vectors))
+
+        s = torch.empty(threshold_terms, dtype=torch.long, device=visual_feature_vectors.device)
+        for i in range(threshold_terms):
+            if i == 0:
+                m2 = cosine_matrix
+            else:
+                m2 = torch.index_select(cosine_matrix, 0, 
+                                        torch.index_select(s, 0, torch.arange(0, i, device=cosine_matrix.device)))
+
+            if i == 0:
+                # Step1: DivPrune 要求选取每个 token[i] 与之最相似的 token[j]
+                # dim = 0，表示每列上选 topk，largest=False 表示取最小的 2 个值，topk 会生成形状为 (2, num_patches) 的张量
+                # values[1,:]，表示每列选取第二小的（即忽略自身的相似度），得到一维向量 (num_patches,)
+                scores = torch.topk(m2, 2, dim=0, largest=False).values[1,:] #for distance
+            else:
+                scores = torch.min(m2, dim=0).values #for distance 
+
+            #Step2: 从 scores 中选取最大的值（最相似中找到最不相似的，即最具多样性的）对应的索引，加入备选队列
+            phrase_to_add_idx = torch.argmax(scores)
+            s[i] = phrase_to_add_idx
+
+        # 返回 cosine_matrix 可以避免重复冗余的余弦相似度计算
+        return s, cosine_matrix
+    
+    # divprune
+    def prepare_inputs_by_divprune(self, inputs_embeds, image_embeds, 
+                                   position_ids, cache_position, attention_mask):
+        SYS_TOKEN_LEN = 15
+        diverse_ratio = float(os.environ['SUBSET_RATIO']) #define the subset selection ratio
+        cosine_matrix = None
+        img_feature_len = image_embeds.shape[0]
+
+        # visual_tokens 形状 (patches, feature_dim)
+        visual_tokens = inputs_embeds[0][SYS_TOKEN_LEN:SYS_TOKEN_LEN+img_feature_len]
+        # 返回的是保留的视觉 token 的"索引"和余弦相似度矩阵
+        selected_visual_tokens, cosine_matrix = \
+            self.divprune(image_embeds, img_feature_len, cosine_matrix, threshold_ratio=diverse_ratio)
+                    
+        # 广播操作，每个分量都会加上偏移 SYS_TOKEN_LEN，用于计算在原 token 序列对应索引
+        selected_visual_tokens += SYS_TOKEN_LEN
+        # [0, 1, 2, ..., SYS_TOKEN_LEN-1, selected_visual_tokens, ..., SYS_TOKEN_LEN+img_feature_len, ...]
+        keep_indexs = torch.cat((torch.arange(SYS_TOKEN_LEN, device=inputs_embeds.device), 
+                                    selected_visual_tokens,
+                                    torch.arange(SYS_TOKEN_LEN+img_feature_len,inputs_embeds.shape[1], 
+                                                device=inputs_embeds.device)))
+        # 主要是对 selected_visual_tokens 进行排序
+        # sort() 返回的是 namedtuple，(values, indices)，values为排序后的张量本身，indices 为原始索引排序后的位置
+        keep_indexs = keep_indexs.sort().values
+
+        # 由于 Llava 确保了同一个batch每个样本的视觉 patch token 排布一致，第一个样本得到的多样性特征适用后面每个样本
+        inputs_embeds = inputs_embeds[:, keep_indexs, :]
+        # 对position_ids 和 attention_mask 作更新，只关注保留下来的 token 的索引
+        if position_ids is not None:
+            position_ids = position_ids[..., keep_indexs]
+        if cache_position is not None:
+            cache_position = cache_position[keep_indexs]
+        if attention_mask is not None:
+            attention_mask = attention_mask[:, keep_indexs]
+
+        return inputs_embeds, position_ids, cache_position, attention_mask
+
     @auto_docstring
     def forward(
         self,
@@ -1261,7 +1394,6 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         second_per_grid_ts (`torch.Tensor` of shape `(num_videos)`, *optional*):
             The time interval (in seconds) for each grid along the temporal dimension in the 3D position IDs.
         """
-
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1269,15 +1401,22 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if inputs_embeds is None:
+            # inputs_embeds.shape = [batch_size, sql_len, hidden_size]
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
         if pixel_values is not None:
             image_embeds = self.get_image_features(pixel_values, image_grid_thw)
+            # image_embeds.shape = (num_patches, hidden_size) = (324, 3584)
             image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
             image_mask, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
             )
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+            # divPrune
+            if pixel_values is not None and os.environ.get("SUBSET_RATIO") not in ("0", None, ""):
+                inputs_embeds, position_ids, cache_position, attention_mask = self.prepare_inputs_by_divprune(
+                    inputs_embeds, image_embeds, position_ids, cache_position, attention_mask)
 
         if pixel_values_videos is not None:
             video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
@@ -1333,7 +1472,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             cache_position=cache_position,
             **kwargs,
         )
-
+        
         output = Qwen2_5_VLModelOutputWithPast(
             last_hidden_state=outputs.last_hidden_state,
             past_key_values=outputs.past_key_values,
@@ -1341,6 +1480,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             attentions=outputs.attentions,
             rope_deltas=self.rope_deltas,
         )
+
         return output if return_dict else output.to_tuple()
 
 
@@ -1484,7 +1624,6 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "The image shows a street scene with a red stop sign in the foreground. In the background, there is a large red gate with Chinese characters ..."
         ```"""
-
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states

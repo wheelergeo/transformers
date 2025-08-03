@@ -173,6 +173,8 @@ class Qwen2_5_VLProcessor(ProcessorMixin):
             merge_length = self.image_processor.merge_size**2
             index = 0
             for i in range(len(text)):
+                # self.image_token = "<|image_pad|>"
+                # 将 <|image_pad|> 替换成 num_image_tokens 个 <|placeholder|>，然后再替换成 <|image_pad|>
                 while self.image_token in text[i]:
                     num_image_tokens = image_grid_thw[index].prod() // merge_length
                     text[i] = text[i].replace(self.image_token, "<|placeholder|>" * num_image_tokens, 1)
@@ -190,16 +192,19 @@ class Qwen2_5_VLProcessor(ProcessorMixin):
                 text[i] = text[i].replace("<|placeholder|>", self.video_token)
 
         return_tensors = output_kwargs["text_kwargs"].pop("return_tensors", None)
+        # mm_token 表示 multimodal token
         return_mm_token_type_ids = output_kwargs["text_kwargs"].pop("return_mm_token_type_ids", None)
         text_inputs = self.tokenizer(text, **output_kwargs["text_kwargs"])
         self._check_special_mm_tokens(text, text_inputs, modalities=["image", "video"])
 
+        # 标识 image token 和 text token 的位置，位置为 0 表示 text token，位置为 1 表示 image token
         if return_mm_token_type_ids:
             array_ids = np.array(text_inputs["input_ids"])
             mm_token_type_ids = np.zeros_like(text_inputs["input_ids"])
             mm_token_type_ids[array_ids == self.image_token_id] = 1
             text_inputs["mm_token_type_ids"] = mm_token_type_ids.tolist()
 
+        # BatchFeature 将 data 内容转换成指定类型的 tensor，并将 data 转换成一个自定义的 Dict
         return BatchFeature(data={**text_inputs, **image_inputs, **videos_inputs}, tensor_type=return_tensors)
 
     def _get_num_multimodal_tokens(self, image_sizes=None, video_sizes=None, **kwargs):

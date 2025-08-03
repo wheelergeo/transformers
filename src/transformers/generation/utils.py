@@ -1662,7 +1662,6 @@ class GenerationMixin(ContinuousMixin):
         inputs_tensor,
     ):
         """Prepared max and min length in generation configs to avoid clashes between similar attributes"""
-
         if generation_config.max_new_tokens is not None:
             if not has_default_max_length and generation_config.max_length is not None:
                 logger.warning(
@@ -2461,6 +2460,8 @@ class GenerationMixin(ContinuousMixin):
         input_ids_length = input_ids.shape[1]
         has_default_max_length = kwargs.get("max_length") is None and generation_config.max_length is not None
         has_default_min_length = kwargs.get("min_length") is None and generation_config.min_length is not None
+        # max_new_token is the number of new tokens to generate, not the total length of the sequence
+        # max_length is the total length of the sequence, including the input_ids
         generation_config = self._prepare_generated_length(
             generation_config=generation_config,
             has_default_max_length=has_default_max_length,

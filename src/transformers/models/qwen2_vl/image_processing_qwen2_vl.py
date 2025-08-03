@@ -224,6 +224,7 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
                 - `"channels_last"` or `ChannelDimension.LAST`: image in (height, width, num_channels) format.
                 - `"none"` or `ChannelDimension.NONE`: image in (height, width) format.   - `"none"` or `ChannelDimension.NONE`: image in (height, width) format.
         """
+        # 将一个 batch 的图片转换为一个一维的图片列表
         images = make_list_of_images(images)
 
         if do_convert_rgb:
@@ -268,9 +269,11 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
             image = to_channel_dimension_format(image, data_format, input_channel_dim=input_data_format)
             processed_images.append(image)
 
+        # convert the list of images to a numpy array
         patches = np.array(processed_images)
         if data_format == ChannelDimension.LAST:
             patches = patches.transpose(0, 3, 1, 2)
+        # make sure the patches are an integer multiple of temporal_patch_size, or pad with the last patch
         if patches.shape[0] % temporal_patch_size != 0:
             repeats = np.repeat(
                 patches[-1][np.newaxis], temporal_patch_size - (patches.shape[0] % temporal_patch_size), axis=0
@@ -405,6 +408,7 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
         do_convert_rgb = do_convert_rgb if do_convert_rgb is not None else self.do_convert_rgb
 
         if images is not None:
+            # 确保图片是一个一维的图片列表，而不是嵌套列表（列表中还包含子列表）
             images = make_flat_list_of_images(images)
 
         if images is not None and not valid_images(images):
@@ -413,6 +417,7 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
                 "torch.Tensor, tf.Tensor or jax.ndarray."
             )
 
+        # 验证图片处理参数的有效性
         validate_preprocess_arguments(
             rescale_factor=rescale_factor,
             do_normalize=do_normalize,
@@ -444,7 +449,9 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
                     do_convert_rgb=do_convert_rgb,
                     input_data_format=input_data_format,
                 )
+                # extend 用于将原 list 解包后，按元素插入新 list 末尾
                 pixel_values.extend(patches)
+                # append 用于将整个 list 作为一个元素插入新 list 末尾
                 vision_grid_thws.append(image_grid_thw)
             pixel_values = np.array(pixel_values)
             vision_grid_thws = np.array(vision_grid_thws)

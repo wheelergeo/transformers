@@ -4,8 +4,8 @@ import re
 import matplotlib.pyplot as plt
 
 
-def plot_performance():
-    perf_dir = "./workdir/performance"
+def plot_performance(perf_dir: str = "./workdir/performance",
+                     save_path: str = "./workdir/performance/performance.png"):
     pattern = re.compile(r"performance_tome_r-(\d+)\.json")
     indices, flops, accuracy, throughput = [], [], [], []
 
@@ -31,22 +31,21 @@ def plot_performance():
     ax1 = plt.gca()
     # 创建共享x轴的第二个y轴
     ax2 = ax1.twinx()
-    ax1.plot(indices, flops, 'b-', label="FLOPs (g)")
-    ax1.plot(indices, throughput, 'r-', label="Throughput (im/s)")
-    ax2.plot(indices, accuracy, 'y-', label="Accuracy (%)")
+    ax1.plot(indices, flops, 'b--', label="FLOPs (g)")
+    ax1.plot(indices, throughput, 'b-', label="Throughput (im/s)")
+    ax2.plot(indices, accuracy, 'r-', label="Accuracy (%)")
 
     ax1.set_xlabel("r")
     ax1.set_ylabel("FLOPs / Throughput", color='b')
-    ax2.set_ylabel("Accuracy", color='y')
+    ax2.set_ylabel("Accuracy", color='r')
 
     ax1.legend(loc='upper left')
     ax2.legend(loc='upper right')
+
+    ax2.set_ylim(40.0, 90.0)
     plt.title("Token Merging Performance")
     plt.grid(True)
     plt.tight_layout()
     plt.show()
 
-    plt.savefig(os.path.join(perf_dir, "performance.png"))
-
-if __name__ == "__main__":
-    plot_performance()
+    plt.savefig(save_path)
