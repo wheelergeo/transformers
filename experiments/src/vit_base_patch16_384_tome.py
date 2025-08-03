@@ -13,17 +13,6 @@ import argparse
 import json
 
 
-def inspect_labels():
-    # generate dataloader
-    data_transform = transforms.Compose([
-        transforms.Resize(384),
-        transforms.CenterCrop(384),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-    ])
-    test_dataset = datasets.ImageNet(root=args.dataset_path, split='val', transform=data_transform)
-
-
 @torch.no_grad()
 def inference(model: torch.nn.Module,
               image_processor,
@@ -50,9 +39,9 @@ def inference(model: torch.nn.Module,
     return accu_num.item() / sample_num
 
 
-def evaluate(args):
+def evaluate(args: argparse.Namespace):
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    if not args.tome_r:
+    if args.tome_r:
         os.environ["TOME_R"] = str(args.tome_r)
     
     # generate dataloader
@@ -103,7 +92,7 @@ def evaluate(args):
     throughput = total_images / inference_time if inference_time > 0 else 0
     
     # 打印结果
-    print(f"\n=== Performance Metrics ===")
+    print(f"\n--- r={args.tome_r} Performance Metrics ---")
     print(f"Device: {device}")
     print(f"FLOPs: {flops}, Params: {params}")
     print(f"Total images processed: {total_images}")
