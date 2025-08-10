@@ -231,7 +231,10 @@ class ViTSelfAttention(nn.Module):
         # b: [batch_size, num_patches / 2, embed_dim]
         a, b = k[..., ::2, :], k[..., 1::2, :]
         # 避免 r 超过当前层可以合并的最大 token 数
+        if a.shape[-2] == 1:
+            return None
         r = min(r, b.shape[-2])
+        
 
         # dot product to get similarity scores
         # scores: [batch_size, num_patches / 2 + 1, num_patches / 2]
@@ -483,7 +486,7 @@ class ViTLayer(GradientCheckpointingLayer):
         hidden_states = attention_output + hidden_states
         
         # Token Merging
-        if os.environ.get("TOME_R") not in ("0", None, ""):
+        if os.environ.get("TOME_R") not in ("0", None, "") and self.attention.merge_fn is not None:
             hidden_states = self.attention.merge_fn(hidden_states)[0]
 
         # in ViT, layernorm is also applied after self-attention
