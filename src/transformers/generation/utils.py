@@ -2575,6 +2575,7 @@ class GenerationMixin(ContinuousMixin):
                 streamer=streamer,
                 **model_kwargs,
             )
+
         elif generation_mode == GenerationMode.DOLA_GENERATION:
             if not trust_remote_code:
                 logger.warning_once(
@@ -2625,6 +2626,7 @@ class GenerationMixin(ContinuousMixin):
             # 11. expand input_ids with `num_return_sequences` additional sequences per batch
             input_ids, model_kwargs = self._expand_inputs_for_generation(
                 input_ids=input_ids,
+                # num_return_sequences is used to generate multiple sequences as candidates
                 expand_size=generation_config.num_return_sequences,
                 is_encoder_decoder=self.config.is_encoder_decoder,
                 **model_kwargs,
