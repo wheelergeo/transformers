@@ -1,0 +1,3 @@
+[submodule "experiments/lmms-eval"]
+	path = experiments/lmms-eval
+	url = git@github.com:wheelergeo/lmms-eval.git
